@@ -1,15 +1,10 @@
 import json
-import logging
 import os
 from datetime import datetime
 import time
-from random import choice
 import boto3
 from botocore.exceptions import ClientError
 import re
-
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
 
 
 # --- Helpers that build all of the responses ---
@@ -71,16 +66,14 @@ def try_ex(func):
         return None
 
 
-def send_sqs_message(queue_name, message):
+def send_sqs_message(queue_url, message):
     # create 'sqs' resource and get the queue
-    sqs = boto3.resource('sqs')
-    queue = sqs.get_queue_by_name(QueueName=queue_name)
-    try:
-        response = queue.send_message(MessageBody=message)
-    except ClientError as e:
-        logging.error(e)
-        return None
-    return response
+    sqs = boto3.client("sqs")
+    
+    sqs.send_message(
+        QueueUrl=queue_url,
+        MessageBody=message,
+    )
 
 
 def push_to_sqs(intent_request):
@@ -102,9 +95,9 @@ def push_to_sqs(intent_request):
         'email': email
     })
 
-    queue_name = 'DiningConciergeQueue'
+    queue_url = 'https://sqs.us-east-1.amazonaws.com/502659756548/Q1'
     # Send message to SQS queue
-    return send_sqs_message(queue_name, message)
+    return send_sqs_message(queue_url, message)
 
 
 def isvalid_location(location):
@@ -182,7 +175,7 @@ def validate_dining_suggestions(slots):
         return build_validation_result(
             False,
             'email',
-            'Sorry, {} is not a valid email. Please type in another email address'.format(
+            'Sorry, {} is not a valid email address. Please try again.'.format(
                 email)
         )
 
@@ -195,18 +188,12 @@ def greeting(intent_request):
     session_attributes = intent_request['sessionAttributes'] if intent_request['sessionAttributes'] is not None else {
     }
 
-    greeting_response_list = [
-        'Hi there!',
-        'Hi there! How can I help you?',
-        'Hello!'
-    ]
-
     return close(
         session_attributes,
         'Fulfilled',
         {
             'contentType': 'PlainText',
-            'content': choice(greeting_response_list)
+            'content': 'Hi there! How can I help you?'
         }
     )
 
@@ -238,7 +225,7 @@ def dining_suggestions(intent_request):
         validation_result = validate_dining_suggestions(slots)
         if not validation_result['isValid']:
             slots[validation_result['violatedSlot']] = None
-            print('got to elicit_slot')
+            
             return elicit_slot(
                 session_attributes,
                 intent_request['currentIntent']['name'],
@@ -249,18 +236,19 @@ def dining_suggestions(intent_request):
 
         # Otherwise, let native DM rules determine how to elicit for slots and prompt for confirmation.
         return delegate(session_attributes, slots)
-
+    
+    print(intent_request)
+    
     # Based on the parameters collected from the user, push the information collected from the user (location, cuisine, etc.) to an SQS queue (Q1).
     # TODO Push the information collected to an SQS Queue
     push_to_sqs(intent_request)
 
-    print('got to close')
     return close(
         session_attributes,
         'Fulfilled',
         {
             'contentType': 'PlainText',
-            'content': 'Cool! We have received your request. We will notify you by SMS once we have the list of restaurant suggestions.'
+            'content': 'Thank you. We will notify you by email once we have the list of restaurant suggestions.'
         }
     )
 
@@ -271,9 +259,6 @@ def dispatch(intent_request):
     """
     Called when the user specifies an intent for this bot.
     """
-    logger.debug('dispatch userId={}, intentName={}'.format(
-        intent_request['userId'], intent_request['currentIntent']['name']))
-
     intent_name = intent_request['currentIntent']['name']
 
     # Dispatch to your bot's intent handlers
@@ -298,6 +283,5 @@ def lambda_handler(event, context):
     # By default, treat the user request as coming from the America/New_York time zone.
     os.environ['TZ'] = 'America/New_York'
     time.tzset()
-    logger.debug('event.bot.name={}'.format(event['bot']['name']))
 
     return dispatch(event)
