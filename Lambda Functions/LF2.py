@@ -99,7 +99,7 @@ def get_restaurant_details(business_id):
 def get_random_restaurant(cuisine, size):
     
     host = 'search-restaurants-ztrhgbms72vkxeodfbhyzfv5dm.us-east-1.es.amazonaws.com'
-    auth = ('jrn8168', 'NQ7OOpet02sbFD3%GQ3zsI&MdorhFMS')
+    auth = ('username', 'password')
     
     client = OpenSearch(
         hosts = [{'host': host, 'port': 443}],
