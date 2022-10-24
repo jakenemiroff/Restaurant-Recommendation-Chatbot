@@ -1,29 +1,18 @@
-"""
-This sample demonstrates an implementation of the Lex Code Hook Interface
-in order to serve a sample bot which manages orders for flowers.
-Bot, Intent, and Slot models which are compatible with this sample can be found in the Lex Console
-as part of the 'OrderFlowers' template.
-
-For instructions on how to set up and test this bot, as well as additional samples,
-visit the Lex Getting Started documentation http://docs.aws.amazon.com/lex/latest/dg/getting-started.html.
-"""
-import math
-import dateutil.parser
-import datetime
-import time
-import os
+import json
 import logging
+import os
+from datetime import datetime
+import time
+from random import choice
+import boto3
+from botocore.exceptions import ClientError
+import re
 
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 
 
-""" --- Helpers to build responses which match the structure of the necessary dialog actions --- """
-
-
-def get_slots(intent_request):
-    return intent_request['currentIntent']['slots']
-
+# --- Helpers that build all of the responses ---
 
 def elicit_slot(session_attributes, intent_name, slots, slot_to_elicit, message):
     return {
@@ -61,131 +50,239 @@ def delegate(session_attributes, slots):
     }
 
 
-""" --- Helper Functions --- """
+# --- Helper Functions ---
 
-
-def parse_int(n):
-    try:
+def safe_int(n):
+    """
+    Safely convert n value to int.
+    """
+    if n is not None:
         return int(n)
-    except ValueError:
-        return float('nan')
+    return n
 
 
-def build_validation_result(is_valid, violated_slot, message_content):
-    if message_content is None:
-        return {
-            "isValid": is_valid,
-            "violatedSlot": violated_slot,
-        }
+def try_ex(func):
+    """
+    Used to safely access dictionary
+    """
+    try:
+        return func()
+    except KeyError:
+        return None
 
+
+def send_sqs_message(queue_name, message):
+    # create 'sqs' resource and get the queue
+    sqs = boto3.resource('sqs')
+    queue = sqs.get_queue_by_name(QueueName=queue_name)
+    try:
+        response = queue.send_message(MessageBody=message)
+    except ClientError as e:
+        logging.error(e)
+        return None
+    return response
+
+
+def push_to_sqs(intent_request):
+    """
+    send the message to the SQS queue
+    """
+    # extract data from intent_request
+    slots = try_ex(lambda: intent_request['currentIntent']['slots'])
+    location = try_ex(lambda: slots['location'])
+    cuisine = try_ex(lambda: slots['cuisine'])
+    dining_time = try_ex(lambda: slots['time'])
+    number_of_people = safe_int(try_ex(lambda: slots['numPeople']))
+    email = try_ex(lambda: slots['email'])
+    message = json.dumps({
+        'location': location,
+        'cuisine': cuisine,
+        'time': dining_time,
+        'numPeople': number_of_people,
+        'email': email
+    })
+
+    queue_name = 'DiningConciergeQueue'
+    # Send message to SQS queue
+    return send_sqs_message(queue_name, message)
+
+
+def isvalid_location(location):
+    location_list = ['new york', 'manhattan', 'brooklyn', 'queens', 'bronx']
+    return location.lower() in location_list
+
+
+def isvalid_cuisine(cuisine):
+    cuisine_list = ['chinese', 'italian', 'indian', 'mexican', 'american', 'japanese']
+    return cuisine.lower() in cuisine_list
+
+
+def isvalid_dining_time(dining_time):
+    now = datetime.now().strftime('%HH:%MM')
+    return dining_time > now
+
+
+def isvalid_number_of_people(number_of_people):
+    return number_of_people > 0
+
+
+def isvalid_email(email):
+    return re.fullmatch(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", email)
+
+
+
+def build_validation_result(isvalid, violated_slot, message_content):
     return {
-        'isValid': is_valid,
+        'isValid': isvalid,
         'violatedSlot': violated_slot,
         'message': {'contentType': 'PlainText', 'content': message_content}
     }
 
 
-def isvalid_date(date):
-    try:
-        dateutil.parser.parse(date)
-        return True
-    except ValueError:
-        return False
-
-
-def validate_order_flowers(flower_type, date, pickup_time):
-    flower_types = ['lilies', 'roses', 'tulips']
-    if flower_type is not None and flower_type.lower() not in flower_types:
-        return build_validation_result(False,
-                                       'FlowerType',
-                                       'We do not have {}, would you like a different type of flower?  '
-                                       'Our most popular flowers are roses'.format(flower_type))
-
-    if date is not None:
-        if not isvalid_date(date):
-            return build_validation_result(False, 'PickupDate', 'I did not understand that, what date would you like to pick the flowers up?')
-        elif datetime.datetime.strptime(date, '%Y-%m-%d').date() <= datetime.date.today():
-            return build_validation_result(False, 'PickupDate', 'You can pick up the flowers from tomorrow onwards.  What day would you like to pick them up?')
-
-    if pickup_time is not None:
-        if len(pickup_time) != 5:
-            # Not a valid time; use a prompt defined on the build-time model.
-            return build_validation_result(False, 'PickupTime', None)
-
-        hour, minute = pickup_time.split(':')
-        hour = parse_int(hour)
-        minute = parse_int(minute)
-        if math.isnan(hour) or math.isnan(minute):
-            # Not a valid time; use a prompt defined on the build-time model.
-            return build_validation_result(False, 'PickupTime', None)
-
-        if hour < 10 or hour > 16:
-            # Outside of business hours
-            return build_validation_result(False, 'PickupTime', 'Our business hours are from ten a m. to five p m. Can you specify a time during this range?')
-
-    return build_validation_result(True, None, None)
-
-
-""" --- Functions that control the bot's behavior --- """
-
-
-def order_flowers(intent_request):
+def validate_dining_suggestions(slots):
     """
-    Performs dialog management and fulfillment for ordering flowers.
-    Beyond fulfillment, the implementation of this intent demonstrates the use of the elicitSlot dialog action
-    in slot validation and re-prompting.
+    Used to validate the slots of the dining suggestion intent
     """
+    # get the slot values
+    location = try_ex(lambda: slots['location'])
+    cuisine = try_ex(lambda: slots['cuisine'])
+    dining_time = try_ex(lambda: slots['time'])
+    number_of_people = safe_int(try_ex(lambda: slots['numPeople']))
+    email = try_ex(lambda: slots['email'])
 
-    flower_type = get_slots(intent_request)["FlowerType"]
-    date = get_slots(intent_request)["PickupDate"]
-    pickup_time = get_slots(intent_request)["PickupTime"]
-    source = intent_request['invocationSource']
+    # validate the slots and return message if any slot was not valid
+    if location and not isvalid_location(location):
+        return build_validation_result(
+            False,
+            'location',
+            'Sorry, we do not know any restaurants in {}. Please choose another location.'.format(
+                location)
+        )
+    if cuisine and not isvalid_cuisine(cuisine):
+        return build_validation_result(
+            False,
+            'cuisine',
+            'Sorry, we do not know any {} restaurants. Please choose another cuisine'.format(
+                cuisine)
+        )
+    if dining_time and not isvalid_dining_time(dining_time):
+        return build_validation_result(
+            False,
+            'time',
+            'Sorry, please choose a time in the future.'
+        )
+    if number_of_people is not None and not isvalid_number_of_people(number_of_people):
+        return build_validation_result(
+            False,
+            'numPeople',
+            'Sorry, we could not find restaurant for {} people. Please choose another party size.'.format(
+                number_of_people)
+        )
+    if email and not isvalid_email(email):
+        return build_validation_result(
+            False,
+            'email',
+            'Sorry, {} is not a valid email. Please type in another email address'.format(
+                email)
+        )
 
-    if source == 'DialogCodeHook':
-        # Perform basic validation on the supplied input slots.
-        # Use the elicitSlot dialog action to re-prompt for the first violation detected.
-        slots = get_slots(intent_request)
+    return {'isValid': True}
 
-        validation_result = validate_order_flowers(flower_type, date, pickup_time)
+
+# --- Functions that control the bot's behavior ---
+
+def greeting(intent_request):
+    session_attributes = intent_request['sessionAttributes'] if intent_request['sessionAttributes'] is not None else {
+    }
+
+    greeting_response_list = [
+        'Hi there!',
+        'Hi there! How can I help you?',
+        'Hello!'
+    ]
+
+    return close(
+        session_attributes,
+        'Fulfilled',
+        {
+            'contentType': 'PlainText',
+            'content': choice(greeting_response_list)
+        }
+    )
+
+
+def thank_you(intent_request):
+    session_attributes = intent_request['sessionAttributes'] if intent_request['sessionAttributes'] is not None else {
+    }
+
+    return close(
+        session_attributes,
+        'Fulfilled',
+        {
+            'contentType': 'PlainText',
+            'content': 'You are welcome! Thank you for using our service!'
+        }
+    )
+
+
+def dining_suggestions(intent_request):
+    # get slot values
+    slots = intent_request['currentIntent']['slots']
+
+    session_attributes = intent_request['sessionAttributes'] if intent_request['sessionAttributes'] is not None else {
+    }
+
+    # if the request is for initiation and validation
+    if intent_request['invocationSource'] == 'DialogCodeHook':
+        # Validate any slots which have been specified.  If any are invalid, re-elicit for their value
+        validation_result = validate_dining_suggestions(slots)
         if not validation_result['isValid']:
             slots[validation_result['violatedSlot']] = None
-            return elicit_slot(intent_request['sessionAttributes'],
-                               intent_request['currentIntent']['name'],
-                               slots,
-                               validation_result['violatedSlot'],
-                               validation_result['message'])
+            print('got to elicit_slot')
+            return elicit_slot(
+                session_attributes,
+                intent_request['currentIntent']['name'],
+                slots,
+                validation_result['violatedSlot'],
+                validation_result['message']
+            )
 
-        # Pass the price of the flowers back through session attributes to be used in various prompts defined
-        # on the bot model.
-        output_session_attributes = intent_request['sessionAttributes'] if intent_request['sessionAttributes'] is not None else {}
-        if flower_type is not None:
-            output_session_attributes['Price'] = len(flower_type) * 5  # Elegant pricing model
+        # Otherwise, let native DM rules determine how to elicit for slots and prompt for confirmation.
+        return delegate(session_attributes, slots)
 
-        return delegate(output_session_attributes, get_slots(intent_request))
+    # Based on the parameters collected from the user, push the information collected from the user (location, cuisine, etc.) to an SQS queue (Q1).
+    # TODO Push the information collected to an SQS Queue
+    push_to_sqs(intent_request)
 
-    # Order the flowers, and rely on the goodbye message of the bot to define the message to the end user.
-    # In a real bot, this would likely involve a call to a backend service.
-    return close(intent_request['sessionAttributes'],
-                 'Fulfilled',
-                 {'contentType': 'PlainText',
-                  'content': 'Thanks, your order for {} has been placed and will be ready for pickup by {} on {}'.format(flower_type, pickup_time, date)})
+    print('got to close')
+    return close(
+        session_attributes,
+        'Fulfilled',
+        {
+            'contentType': 'PlainText',
+            'content': 'Cool! We have received your request. We will notify you by SMS once we have the list of restaurant suggestions.'
+        }
+    )
 
 
-""" --- Intents --- """
-
+# --- Intents ---
 
 def dispatch(intent_request):
     """
     Called when the user specifies an intent for this bot.
     """
-
-    logger.debug('dispatch userId={}, intentName={}'.format(intent_request['userId'], intent_request['currentIntent']['name']))
+    logger.debug('dispatch userId={}, intentName={}'.format(
+        intent_request['userId'], intent_request['currentIntent']['name']))
 
     intent_name = intent_request['currentIntent']['name']
 
     # Dispatch to your bot's intent handlers
-    if intent_name == 'OrderFlowers':
-        return order_flowers(intent_request)
+    if intent_name == 'GreetingIntent':
+        return greeting(intent_request)
+    elif intent_name == 'ThankYouIntent':
+        return thank_you(intent_request)
+    elif intent_name == 'DiningSuggestionsIntent':
+        return dining_suggestions(intent_request)
 
     raise Exception('Intent with name ' + intent_name + ' not supported')
 
